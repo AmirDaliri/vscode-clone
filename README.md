@@ -44,6 +44,7 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
 ```
 vscode-clone <slug> [display name]   create a clone
 vscode-clone --list                  list clones
+vscode-clone --update <slug>         rebuild from the updated original
 vscode-clone --remove <slug>         delete a clone (keeps its profile data)
 ```
 
@@ -107,8 +108,11 @@ Four details are load-bearing and each one breaks the clone in a different way:
 ## Caveats
 
 - **Auto-update is disabled in clones** (`"update.mode": "none"` is seeded into the
-  clone's settings). A self-update would overwrite the re-signed bundle and break
-  it. After you upgrade the real VS Code, re-run `vscode-clone` to refresh a clone.
+  clone's settings). VS Code's updater swaps in a fresh `.app`, which would restore
+  the original `Info.plist` — and since that points `CFBundleExecutable` at a launcher
+  the new bundle doesn't contain, the clone would stop launching entirely. After you
+  upgrade the real VS Code, run `vscode-clone --update <slug>` to rebuild the clone
+  from it; your settings, extensions and Claude login are preserved.
 - **Clones are ad-hoc signed**, not notarized. They run fine locally; Gatekeeper may
   prompt on first launch.
 - **Clones share the original's icon.** Drop in a different `.icns` if you want them

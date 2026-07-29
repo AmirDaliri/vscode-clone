@@ -3,7 +3,7 @@
 # settings, and extensions.
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 PROFILE_ROOT="$HOME/Library/Application Support/VSCodeProfiles"
 MARKER_KEY="VSCodeCloneSlug"
 
@@ -14,6 +14,7 @@ usage() {
   cat <<'EOF'
 usage: vscode-clone <slug> [display name] [--separate-claude]
        vscode-clone --list
+       vscode-clone --update <slug>
        vscode-clone --remove <slug>
        vscode-clone --version
 
@@ -24,6 +25,10 @@ usage: vscode-clone <slug> [display name] [--separate-claude]
 
 Creates /Applications/<Name>-<slug>.app — a fully independent copy with its
 own Dock icon, settings and extensions. The original is never modified.
+
+Clones have auto-update off: VS Code's updater would replace the bundle and
+break the clone's identity. After upgrading the real VS Code, run --update to
+rebuild the clone from it — your settings, extensions and Claude login are kept.
 
 env:
   VSCODE_APP   path to the app to clone
@@ -91,11 +96,42 @@ do_remove() {
   echo "removed. profile data kept at: $PROFILE_ROOT/$(basename "$found" .app)"
 }
 
+find_clone() {
+  local want="$1" app slug found=""
+  while IFS=$'\t' read -r slug app; do
+    [ "$slug" = "$want" ] && found="$app"
+  done < <(each_clone)
+  [ -n "$found" ] || die "no clone with slug '$want' (see: vscode-clone --list)"
+  printf '%s' "$found"
+}
+
+# Rebuild a clone from the (presumably updated) original, keeping its
+# display name, Claude setting, and all profile data.
+do_update() {
+  local want="$1" app; app=$(find_clone "$want")
+  local disp; disp=$(plget "$app" CFBundleDisplayName)
+  local args=("$want" "$disp")
+  if grep -aq "CLAUDE_CONFIG_DIR" "$app/Contents/MacOS/"* 2>/dev/null; then
+    args+=(--separate-claude)
+    echo "preserving: separate Claude login"
+  fi
+  echo "rebuilding '$disp' from the current original..."
+  echo
+
+  local running; running=$(pgrep -f "$app/Contents/MacOS/" || true)
+  for pid in $running; do kill "$pid" 2>/dev/null || true; done
+  [ -n "$running" ] && sleep 2
+
+  rm -rf "$app"
+  exec "$0" "${args[@]}"
+}
+
 case "${1-}" in
   ''|-h|--help) usage; exit 0 ;;
   --version) echo "vscode-clone $VERSION"; exit 0 ;;
   --list) do_list; exit 0 ;;
   --remove) [ $# -ge 2 ] || die "--remove needs a slug"; do_remove "$2"; exit 0 ;;
+  --update) [ $# -ge 2 ] || die "--update needs a slug"; do_update "$2" ;;
 esac
 
 SEPARATE_CLAUDE=0
