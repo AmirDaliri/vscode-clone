@@ -17,10 +17,24 @@ anything.
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AmirDaliri/vscode-clone/main/vscode-clone -o /usr/local/bin/vscode-clone && chmod +x /usr/local/bin/vscode-clone
+sudo mkdir -p /usr/local/bin && sudo curl -fsSL https://raw.githubusercontent.com/AmirDaliri/vscode-clone/main/vscode-clone -o /usr/local/bin/vscode-clone && sudo chmod +x /usr/local/bin/vscode-clone
 ```
 
-Or just download `vscode-clone`, `chmod +x` it, and put it anywhere on your `PATH`.
+`/usr/local/bin` is on the default macOS `PATH` but is root-owned (and often missing
+on Apple Silicon), hence `sudo`. Without it curl fails with
+`(56) Failure writing output to destination`.
+
+Prefer no sudo? Install to `~/.local/bin`:
+
+```bash
+mkdir -p ~/.local/bin && curl -fsSL https://raw.githubusercontent.com/AmirDaliri/vscode-clone/main/vscode-clone -o ~/.local/bin/vscode-clone && chmod +x ~/.local/bin/vscode-clone
+```
+
+then add it to your `PATH` if it isn't already:
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
+```
 
 **Requirements:** macOS, VS Code, and Xcode Command Line Tools (`xcode-select --install`)
 — the tool compiles a small launcher, so it needs `clang`.
