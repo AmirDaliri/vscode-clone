@@ -1,0 +1,304 @@
+#!/bin/bash
+# Create an independent copy of VS Code with its own Dock identity,
+# settings, and extensions.
+set -euo pipefail
+
+VERSION="1.1.0"
+PROFILE_ROOT="$HOME/Library/Application Support/VSCodeProfiles"
+MARKER_KEY="VSCodeCloneSlug"
+
+die() { printf 'error: %s\n' "$1" >&2; exit 1; }
+step() { printf '\033[1;34m==>\033[0m %s\n' "$1"; }
+
+usage() {
+  cat <<'EOF'
+usage: vscode-clone <slug> [display name] [--separate-claude]
+       vscode-clone --list
+       vscode-clone --remove <slug>
+       vscode-clone --version
+
+  <slug>              lowercase letters, digits and dashes, e.g. "work"
+  --separate-claude   give the clone its own Claude Code login, so it can be
+                      signed into a different Claude account than your main
+                      VS Code (sets CLAUDE_CONFIG_DIR for the clone only)
+
+Creates /Applications/<Name>-<slug>.app — a fully independent copy with its
+own Dock icon, settings and extensions. The original is never modified.
+
+env:
+  VSCODE_APP   path to the app to clone
+               (default: first of VS Code, VS Code - Insiders, VSCodium found)
+
+examples:
+  vscode-clone work
+  vscode-clone client-x "VS Code (Client X)"
+  vscode-clone alt "VS Code (Alt Claude)" --separate-claude
+  VSCODE_APP="/Applications/VSCodium.app" vscode-clone oss
+EOF
+}
+
+plget() { plutil -extract "$2" raw -o - "$1/Contents/Info.plist" 2>/dev/null; }
+
+find_source() {
+  if [ -n "${VSCODE_APP-}" ]; then
+    [ -d "$VSCODE_APP" ] || die "VSCODE_APP not found: $VSCODE_APP"
+    printf '%s' "$VSCODE_APP"; return
+  fi
+  local candidate
+  for candidate in \
+    "/Applications/Visual Studio Code.app" \
+    "/Applications/Visual Studio Code - Insiders.app" \
+    "/Applications/VSCodium.app"; do
+    [ -d "$candidate" ] && { printf '%s' "$candidate"; return; }
+  done
+  die "no VS Code found in /Applications — set VSCODE_APP to its path"
+}
+
+each_clone() {
+  local app slug
+  for app in /Applications/*.app; do
+    [ -d "$app" ] || continue
+    slug=$(plget "$app" "$MARKER_KEY") || continue
+    [ -n "$slug" ] && printf '%s\t%s\n' "$slug" "$app"
+  done
+}
+
+do_list() {
+  local out; out=$(each_clone)
+  [ -n "$out" ] || { echo "no clones found"; return; }
+  printf '%s\n' "$out" | while IFS=$'\t' read -r slug app; do
+    printf '%-16s %s\n' "$slug" "$app"
+  done
+}
+
+do_remove() {
+  local want="$1" app found=""
+  while IFS=$'\t' read -r slug app; do
+    [ "$slug" = "$want" ] && found="$app"
+  done < <(each_clone)
+  [ -n "$found" ] || die "no clone with slug '$want' (see: vscode-clone --list)"
+
+  local running; running=$(pgrep -f "$found/Contents/MacOS/" || true)
+  if [ -n "$running" ]; then
+    echo "quitting running clone..."
+    # Only pids belonging to this bundle, never a broad pkill.
+    for pid in $running; do kill "$pid" 2>/dev/null || true; done
+    sleep 2
+  fi
+
+  step "removing $found"
+  rm -rf "$found"
+  echo "removed. profile data kept at: $PROFILE_ROOT/$(basename "$found" .app)"
+}
+
+case "${1-}" in
+  ''|-h|--help) usage; exit 0 ;;
+  --version) echo "vscode-clone $VERSION"; exit 0 ;;
+  --list) do_list; exit 0 ;;
+  --remove) [ $# -ge 2 ] || die "--remove needs a slug"; do_remove "$2"; exit 0 ;;
+esac
+
+SEPARATE_CLAUDE=0
+POSITIONAL=()
+for arg in "$@"; do
+  case "$arg" in
+    --separate-claude) SEPARATE_CLAUDE=1 ;;
+    -*) die "unknown option: $arg" ;;
+    *) POSITIONAL+=("$arg") ;;
+  esac
+done
+set -- "${POSITIONAL[@]}"
+[ $# -ge 1 ] || die "missing slug"
+
+SLUG="$1"
+[[ "$SLUG" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "slug must be lowercase letters, digits, dashes"
+
+command -v clang >/dev/null || die "clang not found — run: xcode-select --install"
+[ -w /Applications ] || die "/Applications is not writable by $(whoami)"
+
+SRC=$(find_source)
+SRC_NAME=$(plget "$SRC" CFBundleName)      || die "unreadable Info.plist in $SRC"
+SRC_EXEC=$(plget "$SRC" CFBundleExecutable) || die "no CFBundleExecutable in $SRC"
+SRC_ID=$(plget "$SRC" CFBundleIdentifier)   || die "no CFBundleIdentifier in $SRC"
+[ -f "$SRC/Contents/Resources/app/product.json" ] || die "$SRC is not a VS Code-family app"
+
+# CFBundleName must stay filesystem-safe: Electron resolves its helper bundles
+# as "<CFBundleName> Helper*.app".
+BUNDLE_NAME="$(printf '%s' "$SRC_NAME" | tr -cd '[:alnum:]')-$SLUG"
+DISPLAY_NAME="${2-$SRC_NAME ($SLUG)}"
+CLONE="/Applications/$BUNDLE_NAME.app"
+BUNDLE_ID="$SRC_ID.$SLUG"
+WRAPPER_NAME="CloneProfileLauncher"
+
+[ -e "$CLONE" ] && die "$CLONE already exists (remove it with: vscode-clone --remove $SLUG)"
+
+DATA_DIR="$PROFILE_ROOT/$BUNDLE_NAME/user-data"
+EXT_DIR="$PROFILE_ROOT/$BUNDLE_NAME/extensions"
+CLAUDE_DIR="$PROFILE_ROOT/$BUNDLE_NAME/claude"
+
+ARCHS=$(lipo -archs "$SRC/Contents/MacOS/$SRC_EXEC" 2>/dev/null) || die "cannot read archs of $SRC_EXEC"
+ARCH_FLAGS=(); for a in $ARCHS; do ARCH_FLAGS+=(-arch "$a"); done
+
+echo "source:  $SRC ($ARCHS)"
+echo "clone:   $CLONE"
+echo
+
+step "creating profile directories"
+mkdir -p "$DATA_DIR/User" "$EXT_DIR"
+[ "$SEPARATE_CLAUDE" = 1 ] && mkdir -p "$CLAUDE_DIR"
+
+# A clone that updated itself would replace the re-signed bundle and break it.
+if [ ! -f "$DATA_DIR/User/settings.json" ]; then
+  printf '{\n  "update.mode": "none"\n}\n' > "$DATA_DIR/User/settings.json"
+fi
+
+step "copying bundle"
+ditto --noqtn "$SRC" "$CLONE"
+
+step "rewriting Info.plist"
+PLIST="$CLONE/Contents/Info.plist"
+plutil -replace CFBundleIdentifier -string "$BUNDLE_ID" "$PLIST"
+plutil -replace CFBundleName -string "$BUNDLE_NAME" "$PLIST"
+plutil -replace CFBundleDisplayName -string "$DISPLAY_NAME" "$PLIST"
+plutil -replace CFBundleExecutable -string "$WRAPPER_NAME" "$PLIST"
+plutil -replace "$MARKER_KEY" -string "$SLUG" "$PLIST"
+plutil -remove ElectronTeamID "$PLIST" 2>/dev/null || true
+
+step "renaming helper bundles"
+FW="$CLONE/Contents/Frameworks"
+for suffix in "" " (GPU)" " (Plugin)" " (Renderer)"; do
+  old="$FW/$SRC_NAME Helper$suffix.app"
+  new="$FW/$BUNDLE_NAME Helper$suffix.app"
+  [ -d "$old" ] || die "missing helper bundle: $SRC_NAME Helper$suffix.app"
+  mv "$old" "$new"
+  mv "$new/Contents/MacOS/$SRC_NAME Helper$suffix" "$new/Contents/MacOS/$BUNDLE_NAME Helper$suffix"
+  hp="$new/Contents/Info.plist"
+  plutil -replace CFBundleExecutable -string "$BUNDLE_NAME Helper$suffix" "$hp"
+  plutil -replace CFBundleName -string "$BUNDLE_NAME Helper$suffix" "$hp"
+  plutil -replace CFBundleIdentifier -string "$BUNDLE_ID.helper" "$hp"
+  plutil -remove ElectronTeamID "$hp" 2>/dev/null || true
+done
+
+step "rebranding product.json"
+python3 - "$CLONE/Contents/Resources/app/product.json" "$DISPLAY_NAME" "$BUNDLE_ID" "$BUNDLE_NAME" <<'PY'
+import json, sys
+path, name, bundle_id, folder = sys.argv[1:5]
+with open(path) as f:
+    product = json.load(f)
+product["nameLong"] = name
+product["darwinBundleIdentifier"] = bundle_id
+# Three separate keys; miss one and the clone still shares that folder
+# with the original.
+product["dataFolderName"] = f".{folder}"
+product["sharedDataFolderName"] = f".{folder}-shared"
+product["serverDataFolderName"] = f".{folder}-server"
+with open(path, "w") as f:
+    json.dump(product, f, indent=2)
+PY
+
+step "compiling launcher wrapper ($ARCHS)"
+SRC_C=$(mktemp -t vscode-clone-wrapper).c
+trap 'rm -f "$SRC_C"' EXIT
+
+# Paths are baked in as literals so the wrapper needs no argv or env
+# cooperation to know where its profile lives.
+{
+  printf '#define PROFILE_DATA_DIR "%s"\n' "$DATA_DIR"
+  printf '#define PROFILE_EXT_DIR "%s"\n' "$EXT_DIR"
+  printf '#define REAL_EXEC "%s"\n' "$SRC_EXEC"
+  [ "$SEPARATE_CLAUDE" = 1 ] && printf '#define PROFILE_CLAUDE_DIR "%s"\n' "$CLAUDE_DIR"
+  cat <<'CSRC'
+#include <errno.h>
+#include <limits.h>
+#include <mach-o/dyld.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+static int is_flag(const char *arg, const char *flag) {
+  size_t n = strlen(flag);
+  return strncmp(arg, flag, n) == 0 && (arg[n] == '\0' || arg[n] == '=');
+}
+
+static int is_bare(const char *arg, const char *flag) { return strcmp(arg, flag) == 0; }
+
+int main(int argc, char **argv) {
+  char self[PATH_MAX], real[PATH_MAX];
+  uint32_t size = sizeof(self);
+  if (_NSGetExecutablePath(self, &size) != 0) {
+    fprintf(stderr, "clone-wrapper: executable path too long\n");
+    return 127;
+  }
+  if (realpath(self, real) == NULL) {
+    perror("clone-wrapper: realpath");
+    return 127;
+  }
+  char *slash = strrchr(real, '/');
+  if (slash == NULL) return 127;
+  *(slash + 1) = '\0';
+  if (strlcat(real, REAL_EXEC, sizeof(real)) >= sizeof(real)) return 127;
+
+#ifdef PROFILE_CLAUDE_DIR
+  /* Claude Code keys its login to this dir, so the clone gets its own account. */
+  if (setenv("CLAUDE_CONFIG_DIR", PROFILE_CLAUDE_DIR, 1) != 0) {
+    perror("clone-wrapper: setenv CLAUDE_CONFIG_DIR");
+    return 127;
+  }
+#endif
+
+  char **out = calloc((size_t)argc + 3, sizeof(char *));
+  if (out == NULL) { perror("clone-wrapper: calloc"); return 127; }
+
+  int n = 0;
+  out[n++] = argv[0];
+  out[n++] = (char *)"--user-data-dir=" PROFILE_DATA_DIR;
+  out[n++] = (char *)"--extensions-dir=" PROFILE_EXT_DIR;
+
+  /* Drop caller-supplied copies so the isolation cannot be overridden. */
+  for (int i = 1; i < argc; i++) {
+    if (is_flag(argv[i], "--user-data-dir") || is_flag(argv[i], "--extensions-dir")) {
+      if (is_bare(argv[i], "--user-data-dir") || is_bare(argv[i], "--extensions-dir")) i++;
+      continue;
+    }
+    out[n++] = argv[i];
+  }
+  out[n] = NULL;
+
+  execv(real, out);
+  fprintf(stderr, "clone-wrapper: execv(%s) failed: %s\n", real, strerror(errno));
+  return 127;
+}
+CSRC
+} > "$SRC_C"
+
+clang "${ARCH_FLAGS[@]}" -O2 -Wall -o "$CLONE/Contents/MacOS/$WRAPPER_NAME" "$SRC_C" \
+  || die "wrapper failed to compile"
+
+step "re-signing (ad-hoc)"
+ENT=$(mktemp -t vscode-clone-ent).plist
+codesign -d --entitlements - --xml "$SRC" 2>/dev/null > "$ENT" || true
+codesign --force --deep --sign - "$CLONE" 2>/dev/null
+[ -s "$ENT" ] && codesign --force --sign - --entitlements "$ENT" "$CLONE" 2>/dev/null
+rm -f "$ENT"
+
+step "registering with LaunchServices"
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+  -f "$CLONE" 2>/dev/null || true
+
+cat <<EOF
+
+done.
+
+  app        $CLONE
+  bundle id  $BUNDLE_ID
+  settings   $DATA_DIR
+  extensions $EXT_DIR$([ "$SEPARATE_CLAUDE" = 1 ] && printf '\n  claude     %s  (sign in separately)' "$CLAUDE_DIR")
+
+open it:
+  open -a "$CLONE"
+
+auto-update is off in the clone — re-run this after upgrading the original
+to pick up a new version.
+EOF
