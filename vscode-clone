@@ -3,7 +3,7 @@
 # settings, and extensions.
 set -euo pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 PROFILE_ROOT="$HOME/Library/Application Support/VSCodeProfiles"
 MARKER_KEY="VSCodeCloneSlug"
 
@@ -15,6 +15,7 @@ usage() {
 usage: vscode-clone <slug> [display name] [--separate-claude]
        vscode-clone --list
        vscode-clone --update <slug>
+       vscode-clone --update-all
        vscode-clone --remove <slug>
        vscode-clone --version
 
@@ -68,12 +69,29 @@ each_clone() {
   done
 }
 
+app_version() {
+  python3 -c "
+import json,sys
+try: print(json.load(open(sys.argv[1]+'/Contents/Resources/app/product.json')).get('version','?'))
+except Exception: print('?')
+" "$1" 2>/dev/null
+}
+
 do_list() {
   local out; out=$(each_clone)
   [ -n "$out" ] || { echo "no clones found"; return; }
-  printf '%s\n' "$out" | while IFS=$'\t' read -r slug app; do
-    printf '%-16s %s\n' "$slug" "$app"
-  done
+  local src srcver; src=$(find_source); srcver=$(app_version "$src")
+  printf '%-14s %-10s %-10s %s\n' "SLUG" "VERSION" "STATUS" "APP"
+  local slug app ver status stale=0
+  while IFS=$'\t' read -r slug app; do
+    ver=$(app_version "$app")
+    if [ "$ver" = "$srcver" ]; then status="current"; else status="outdated"; stale=1; fi
+    printf '%-14s %-10s %-10s %s\n' "$slug" "$ver" "$status" "$app"
+  done <<< "$out"
+  echo
+  echo "original: $srcver  ($src)"
+  [ "$stale" = 1 ] && echo && echo "some clones are outdated — run: vscode-clone --update-all"
+  return 0
 }
 
 do_remove() {
@@ -126,12 +144,34 @@ do_update() {
   exec "$0" "${args[@]}"
 }
 
+# Rebuild only the clones whose version has drifted from the original.
+do_update_all() {
+  local src srcver out slug app ver done_any=0
+  src=$(find_source); srcver=$(app_version "$src")
+  out=$(each_clone)
+  [ -n "$out" ] || { echo "no clones found"; return; }
+  while IFS=$'\t' read -r slug app; do
+    ver=$(app_version "$app")
+    if [ "$ver" = "$srcver" ]; then
+      echo "$slug: already $ver, skipping"
+      continue
+    fi
+    echo
+    echo "=== $slug: $ver -> $srcver ==="
+    "$0" --update "$slug" || die "failed updating $slug"
+    done_any=1
+  done <<< "$out"
+  [ "$done_any" = 0 ] && { echo; echo "all clones already match $srcver"; }
+  return 0
+}
+
 case "${1-}" in
   ''|-h|--help) usage; exit 0 ;;
   --version) echo "vscode-clone $VERSION"; exit 0 ;;
   --list) do_list; exit 0 ;;
   --remove) [ $# -ge 2 ] || die "--remove needs a slug"; do_remove "$2"; exit 0 ;;
   --update) [ $# -ge 2 ] || die "--update needs a slug"; do_update "$2" ;;
+  --update-all) do_update_all; exit 0 ;;
 esac
 
 SEPARATE_CLAUDE=0
